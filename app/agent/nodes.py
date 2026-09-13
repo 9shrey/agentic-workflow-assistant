@@ -270,40 +270,60 @@ def approval_checkpoint_node(state: AgentState, db: Session) -> dict:
 
 
 def execute_approved_actions_node(state: AgentState, db: Session) -> dict:
-    """Execute actions that have been approved.
+    """Execute exactly the actions a human approved.
 
-    This is a special node that processes approved items. In a real system,
-    this would be called after the human approves, but for the mock MVP,
-    it simply marks approved actions ready.
+    Approvals are matched **per item** — by the draft_id / event_id carried in
+    each approval's payload — not per approval_type. Approving one draft and
+    rejecting another therefore executes only the approved one.
+
+    The node is idempotent: the plan can route through it more than once (one
+    step per action type), so once the actions have run it returns without
+    re-executing or re-logging them.
     """
+    if state.approval_status == "approved_actions_executed":
+        return {}
+
     audit = AuditService(db)
 
-    approved_ids = set()
+    approved_draft_ids: set[str] = set()
+    approved_event_ids: set[str] = set()
     for approval_data in state.pending_approvals:
-        if approval_data.get("status") == "approved":
-            approved_ids.add(approval_data.get("approval_type"))
+        if approval_data.get("status") != "approved":
+            continue
+        payload = approval_data.get("proposed_payload") or {}
+        if approval_data.get("approval_type") == "gmail_draft":
+            if payload.get("draft_id"):
+                approved_draft_ids.add(payload["draft_id"])
+        elif approval_data.get("approval_type") == "calendar_event":
+            if payload.get("event_id"):
+                approved_event_ids.add(payload["event_id"])
 
-    if "gmail_draft" in approved_ids:
-        for draft in state.proposed_email_drafts:
-            audit.log_call(
-                workflow_id=state.workflow_id,
-                tool_name="execute_gmail_draft",
-                input_payload=draft.model_dump(),
-                output_payload={"status": "draft_created", "draft_id": draft.draft_id},
-            )
-            state.approved_drafts.append(draft)
+    approved_drafts = [
+        d for d in state.proposed_email_drafts if d.draft_id in approved_draft_ids
+    ]
+    approved_events = [
+        e for e in state.proposed_calendar_events if e.event_id in approved_event_ids
+    ]
 
-    if "calendar_event" in approved_ids:
-        for event in state.proposed_calendar_events:
-            audit.log_call(
-                workflow_id=state.workflow_id,
-                tool_name="execute_calendar_event",
-                input_payload=event.model_dump(),
-                output_payload={"status": "event_created", "event_id": event.event_id},
-            )
-            state.approved_events.append(event)
+    for draft in approved_drafts:
+        audit.log_call(
+            workflow_id=state.workflow_id,
+            tool_name="execute_gmail_draft",
+            input_payload=draft.model_dump(),
+            output_payload={"status": "draft_created", "draft_id": draft.draft_id},
+        )
+
+    for event in approved_events:
+        audit.log_call(
+            workflow_id=state.workflow_id,
+            tool_name="execute_calendar_event",
+            input_payload=event.model_dump(),
+            output_payload={"status": "event_created", "event_id": event.event_id},
+        )
 
     return {
+        "approved_drafts": approved_drafts,
+        "approved_events": approved_events,
         "completed_tool_calls": state.completed_tool_calls + ["execute_approved"],
         "approval_status": "approved_actions_executed",
     }

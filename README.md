@@ -55,10 +55,38 @@ LangGraph-based workflow automation agent integrating Gmail and Google Calendar 
 8. **Execute Approved** - Create Gmail drafts and Calendar events for approved items
 9. **Final Summary** - Generate comprehensive action report
 
+## LangGraph Implementation
+
+The workflow is a compiled `StateGraph` (`app/agent/graph.py`), not a hand-rolled loop:
+
+| Concern | How it is wired |
+|---|---|
+| **State schema** | `AgentState` — a Pydantic model — is passed directly to `StateGraph(AgentState)`, so state stays typed end to end |
+| **Nodes** | All 9 steps are registered with `add_node`. Each keeps a plain `(AgentState, Session) -> dict` signature, so every node is unit-testable without building a graph |
+| **Edges** | `add_conditional_edges(node, router, targets)` for every node. `router` is a pure `AgentState -> str` function with no LLM call; it already returns LangGraph's `END` sentinel verbatim |
+| **Human-in-the-loop** | The approval node calls LangGraph's `interrupt()`. The graph genuinely suspends — `get_state().next` reports `("approval_checkpoint_node",)` — and resumes with `Command(resume=decisions)` |
+| **Persistence** | A `SqliteSaver` checkpointer stores graph state, so a run interrupted in one HTTP request resumes in a later one |
+| **Serialization** | The checkpoint serializer takes an explicit allowlist of the project's own models rather than LangGraph's permissive default, since deserializing arbitrary types from the checkpoint DB is a code-execution risk |
+
+The database session is bound into the node closures at graph-build time rather than
+passed through `config["configurable"]`, so no non-serializable object ever reaches the
+checkpointer.
+
+Resuming takes a per-item `approval_id -> "approved" | "rejected"` map. Handing the graph
+a single boolean would apply one reviewer's answer to every outstanding action, so
+rejecting four items and approving the fifth would execute all five.
+
 ## Safety Rules (Enforced)
 
-- **NEVER sends emails automatically** - Gmail scopes are `gmail.compose` (draft only) + `gmail.readonly`
+- **NEVER sends emails** - the code only ever calls `drafts().create`; there is no call
+  to Gmail's send endpoint anywhere in the codebase. Note that the `gmail.compose` scope
+  does itself permit sending, so this guarantee is enforced by the code paths, not by the
+  scope grant.
 - **Calendar events require approval** - No event is created without explicit human approval
+- **Approvals are per item** - every proposed action is approved or rejected on its own
+  row, and a decision on one action is never applied to the others
+- **Approval defaults to deny** - any action without an explicit `approved` decision is
+  treated as rejected
 - **All tool calls are audit logged** - Complete input/output/error tracking per workflow
 
 ## Quick Start

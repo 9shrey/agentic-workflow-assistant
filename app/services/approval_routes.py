@@ -21,91 +21,67 @@ def _get_sync_db() -> Session:
         db.close()
 
 
-@router.post("/{approval_id}/approve")
-async def approve_action(approval_id: str):
-    """Approve a pending action (draft email or calendar event)."""
+def _resume_if_fully_decided(workflow_id: str, db: Session, result: dict) -> dict:
+    """Resume the workflow once every approval for it has been decided.
+
+    The decisions are read back **per row** from the approvals table and handed
+    to the graph as an ``approval_id -> status`` map. Passing a single boolean
+    here would apply one reviewer's answer to every outstanding item, so
+    rejecting four actions and approving the fifth would execute all five.
+    """
+    remaining = (
+        db.query(Approval)
+        .filter(Approval.workflow_id == workflow_id, Approval.status == "pending")
+        .count()
+    )
+    if remaining:
+        result["remaining_approvals"] = remaining
+        return result
+
+    run = db.query(WorkflowRun).filter(WorkflowRun.id == workflow_id).first()
+    if not (run and run.agent_state):
+        result["workflow_resumed"] = False
+        return result
+
+    decisions = {
+        a.id: a.status
+        for a in db.query(Approval).filter(Approval.workflow_id == workflow_id).all()
+    }
+
+    state = AgentState.model_validate(run.agent_state)
+    state = resume_workflow_after_approval(workflow_id, state, db, decisions=decisions)
+    result["workflow_status"] = state.status
+    result["final_response"] = state.final_response
+    result["executed_actions"] = len(state.approved_drafts) + len(state.approved_events)
+    return result
+
+
+def _decide(approval_id: str, decision: str) -> dict:
     db = next(_get_sync_db())
     try:
         svc = ApprovalService(db)
-        approval = svc.decide_approval(approval_id, "approved")
+        approval = svc.decide_approval(approval_id, decision)
         if not approval:
             raise HTTPException(status_code=404, detail="Approval not found")
-
-        # Check if all approvals for this workflow are decided
-        workflow_id = approval.workflow_id
-        remaining = (
-            db.query(Approval)
-            .filter(
-                Approval.workflow_id == workflow_id,
-                Approval.status == "pending",
-            )
-            .count()
-        )
 
         result = {
             "approval_id": approval.id,
             "status": approval.status,
             "decided_at": approval.decided_at.isoformat() if approval.decided_at else None,
-            "workflow_id": workflow_id,
+            "workflow_id": approval.workflow_id,
         }
-
-        # If all approvals decided, resume the workflow
-        if remaining == 0:
-            run = db.query(WorkflowRun).filter(WorkflowRun.id == workflow_id).first()
-            if run and run.agent_state:
-                state = AgentState.model_validate(run.agent_state)
-                state = resume_workflow_after_approval(workflow_id, state, db, approved=True)
-                result["workflow_status"] = state.status
-                result["final_response"] = state.final_response
-            else:
-                result["workflow_resumed"] = False
-        else:
-            result["remaining_approvals"] = remaining
-
-        return result
+        return _resume_if_fully_decided(approval.workflow_id, db, result)
     finally:
         db.close()
+
+
+@router.post("/{approval_id}/approve")
+async def approve_action(approval_id: str):
+    """Approve a single pending action (draft email or calendar event)."""
+    return _decide(approval_id, "approved")
 
 
 @router.post("/{approval_id}/reject")
 async def reject_action(approval_id: str):
-    """Reject a pending action."""
-    db = next(_get_sync_db())
-    try:
-        svc = ApprovalService(db)
-        approval = svc.decide_approval(approval_id, "rejected")
-        if not approval:
-            raise HTTPException(status_code=404, detail="Approval not found")
-
-        # Check if all approvals for this workflow are decided
-        workflow_id = approval.workflow_id
-        remaining = (
-            db.query(Approval)
-            .filter(
-                Approval.workflow_id == workflow_id,
-                Approval.status == "pending",
-            )
-            .count()
-        )
-
-        result = {
-            "approval_id": approval.id,
-            "status": approval.status,
-            "workflow_id": workflow_id,
-        }
-
-        if remaining == 0:
-            run = db.query(WorkflowRun).filter(WorkflowRun.id == workflow_id).first()
-            if run and run.agent_state:
-                state = AgentState.model_validate(run.agent_state)
-                state = resume_workflow_after_approval(workflow_id, state, db, approved=False)
-                result["workflow_status"] = state.status
-                result["final_response"] = state.final_response
-            else:
-                result["workflow_resumed"] = False
-        else:
-            result["remaining_approvals"] = remaining
-
-        return result
-    finally:
-        db.close()
+    """Reject a single pending action."""
+    return _decide(approval_id, "rejected")
